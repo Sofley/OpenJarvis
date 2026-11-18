@@ -544,6 +544,16 @@ if (-not (Test-Path $cfgPath)) {
     & $uvExe run --project $srcDir jarvis init --from-bare-jarvis --no-download --no-scan --engine ollama
     if ($LASTEXITCODE -ne 0) { Write-Warn2 "jarvis init exited $LASTEXITCODE; 'jarvis' will run it on first start." }
 }
+# Safety: no unrestricted shell for a voice assistant. Windows actions come
+# from dedicated tools that ask for confirmation instead.
+if (Test-Path $cfgPath) {
+    $cfgNow = Get-Content -Raw -Path $cfgPath
+    $cfgSafe = $cfgNow -replace ',\s*"shell_exec"', '' -replace '"shell_exec"\s*,\s*', '' -replace '"shell_exec"', ''
+    if ($cfgSafe -ne $cfgNow) {
+        [System.IO.File]::WriteAllText($cfgPath, $cfgSafe, (New-Object System.Text.UTF8Encoding $false))
+        Write-Ok "shell_exec tool disabled in $cfgPath"
+    }
+}
 $soulPath = Join-Path $installRoot 'SOUL.md'
 if ((Test-Path $soulPath) -and -not (Select-String -Path $soulPath -Pattern ([regex]::Unescape('\u043f\u043e-\u0440\u0443\u0441\u0441\u043a\u0438')) -SimpleMatch -Quiet)) {
     # Russian text kept as \u escapes so the script stays pure ASCII.
