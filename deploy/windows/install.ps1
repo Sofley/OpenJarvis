@@ -399,9 +399,9 @@ Write-Info "Installing Python dependencies in $srcDir (this can take a few minut
 Push-Location $srcDir
 try {
     if ($usePrebuiltRust) {
-        & $uvExe sync --extra desktop
+        & $uvExe sync --extra desktop --extra voice-piper
     } else {
-        & $uvExe sync --extra desktop --group desktop-native
+        & $uvExe sync --extra desktop --group desktop-native --extra voice-piper
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "uv sync failed with exit code $LASTEXITCODE. Check the output above."
@@ -531,6 +531,49 @@ if ($ollamaReady) {
     }
 } else {
     Write-Warn2 "Skipping model pull - daemon wasn't ready."
+}
+
+# ---------------------------------------------------------------------------
+# 8b. Russian, offline voice (Piper) + Russian speech recognition by default
+# ---------------------------------------------------------------------------
+
+$cfgPath = Join-Path $installRoot 'config.toml'
+if (-not (Test-Path $cfgPath)) {
+    # Same non-interactive init the bare `jarvis` first-run guard performs.
+    Write-Info "Creating the OpenJarvis config (jarvis init)..."
+    & $uvExe run --project $srcDir jarvis init --from-bare-jarvis --no-download --no-scan --engine ollama
+    if ($LASTEXITCODE -ne 0) { Write-Warn2 "jarvis init exited $LASTEXITCODE; 'jarvis' will run it on first start." }
+}
+$soulPath = Join-Path $installRoot 'SOUL.md'
+if ((Test-Path $soulPath) -and -not (Select-String -Path $soulPath -Pattern ([regex]::Unescape('\u043f\u043e-\u0440\u0443\u0441\u0441\u043a\u0438')) -SimpleMatch -Quiet)) {
+    # Russian text kept as \u escapes so the script stays pure ASCII.
+    $soulRu = "`n`n" + [regex]::Unescape('\u0412\u0441\u0435\u0433\u0434\u0430 \u043e\u0442\u0432\u0435\u0447\u0430\u0439 \u043f\u043e-\u0440\u0443\u0441\u0441\u043a\u0438, \u043a\u043e\u0440\u043e\u0442\u043a\u043e \u0438 \u043f\u043e \u0434\u0435\u043b\u0443: \u0442\u0435\u0431\u044f \u0441\u043b\u0443\u0448\u0430\u044e\u0442 \u0433\u043e\u043b\u043e\u0441\u043e\u043c.') + "`n"
+    [System.IO.File]::AppendAllText($soulPath, $soulRu, (New-Object System.Text.UTF8Encoding $false))
+}
+$cfgText = if (Test-Path $cfgPath) { Get-Content -Raw -Path $cfgPath } else { '' }
+if ($cfgText -notmatch '(?m)^\[speech\]') {
+    $speechCfg = @"
+
+[speech]
+# Russian speech recognition (faster-whisper) and an offline Russian voice.
+language = "ru"
+model = "small"
+compute_type = "int8"
+tts_backend = "piper"
+voice_id = "ru_RU-dmitri-medium"
+voice_speed = 1.0
+"@
+    # UTF-8 without BOM: Python's tomllib rejects a leading BOM.
+    [System.IO.File]::AppendAllText($cfgPath, $speechCfg, (New-Object System.Text.UTF8Encoding $false))
+    Write-Ok "Russian voice settings written to $cfgPath"
+}
+$venvPyVoice = Join-Path $srcDir '.venv\Scripts\python.exe'
+Write-Info "Downloading the Russian Piper voice (~60 MB, once)..."
+& $venvPyVoice -c "from openjarvis.speech.piper_tts import ensure_voice; ensure_voice('ru_RU-dmitri-medium')"
+if ($LASTEXITCODE -eq 0) {
+    Write-Ok "Russian voice ready (works offline)"
+} else {
+    Write-Warn2 "Voice download failed; it will be retried the first time Jarvis speaks."
 }
 
 # ---------------------------------------------------------------------------
