@@ -1,0 +1,74 @@
+# Собирает готовое (предкомпилированное) Rust-расширение openjarvis-rust для Windows
+# и выкладывает его в релиз этого репозитория. Установщик для Windows
+# (deploy/windows/install.ps1) берёт его оттуда, если на компьютере нет
+# Visual Studio Build Tools, — так не нужно ставить несколько гигабайт
+# инструментов сборки на диск C.
+name: Windows Rust wheel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/jarvis-windows-ru]
+    paths:
+      - "rust/**"
+      - ".github/workflows/windows-rust-wheel.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # rust/rust-toolchain.toml закрепляет версию Rust; rustup подхватит её сам.
+      - name: Install maturin
+        run: python -m pip install "maturin>=1.12.6,<2"
+
+      - name: Build wheel
+        run: >
+          python -m maturin build --release
+          --manifest-path rust/crates/openjarvis-python/Cargo.toml
+          --interpreter python --out dist
+
+      - name: Smoke-test the wheel
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import openjarvis_rust; print('openjarvis_rust OK')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}
+          path: dist/*.whl
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to the rust-wheels-windows release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release view rust-wheels-windows --repo "$REPO" >/dev/null 2>&1 || \
+            gh release create rust-wheels-windows --repo "$REPO" --prerelease \
+              --title "Rust extension for Windows (prebuilt)" \
+              --notes "Prebuilt openjarvis-rust wheels for Windows x64. Used by deploy/windows/install.ps1 when MSVC Build Tools are not installed."
+          gh release upload rust-wheels-windows dist/*.whl --repo "$REPO" --clobber

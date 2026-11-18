@@ -60,6 +60,26 @@ run, then check:
 A VM is useful for compatibility testing; it does not validate GPU/NPU
 performance on physical Windows ARM hardware.
 
+## This fork (Sofley/openjarvis): install on D:, no Build Tools
+
+Установка одной командой в PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Sofley/openjarvis/claude/jarvis-windows-ru/deploy/windows/install.ps1 | iex
+```
+
+Отличия от исходного установщика:
+
+- **Диск.** Если на системном диске меньше 20 ГБ свободно, всё ставится на другой
+  локальный диск с наибольшим запасом (например `D:\OpenJarvis`): код, `.venv`,
+  кэш uv, Python для проекта, Ollama и модели. Пути запоминаются в переменных
+  пользователя `OPENJARVIS_HOME`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `OLLAMA_MODELS`.
+- **Без Visual Studio Build Tools.** Если компилятора MSVC нет, Rust-расширение
+  `openjarvis-rust` не собирается, а скачивается готовым из релиза
+  `rust-wheels-windows` этого форка (его собирает workflow «Windows Rust wheel»).
+- **Ollama** ставится в папку установки, и установщик не зависает в ожидании
+  запущенного `ollama app.exe`.
+
 ## What you get
 
 - A PowerShell installer that probes prerequisites, installs `uv`,

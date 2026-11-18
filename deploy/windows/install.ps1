@@ -268,12 +268,45 @@ Write-Ok "uv ($uvExe)"
 # 5. Clone the repo
 # ---------------------------------------------------------------------------
 
+# Where to install. OPENJARVIS_HOME wins; otherwise, when the system drive is
+# short on space (< 20 GB free) and another fixed drive has more room, use
+# <that drive>:\OpenJarvis so the venv, uv caches, Python and models do not
+# fill C:. Everything heavy below is kept under the install root.
+function Get-FreeGB([string] $Drive) {
+    try { return [math]::Floor((Get-PSDrive -Name $Drive -ErrorAction Stop).Free / 1GB) } catch { return 0 }
+}
 $installRoot = if ($env:OPENJARVIS_HOME) {
     $env:OPENJARVIS_HOME
 } else {
-    Join-Path $env:LOCALAPPDATA 'OpenJarvis'
+    $sysDrive = $env:SystemDrive.TrimEnd(':')
+    $best = $null
+    if ((Get-FreeGB $sysDrive) -lt 20) {
+        $best = Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Name -ne $sysDrive -and $_.Free -gt 20GB -and
+                           ([System.IO.DriveInfo]::new($_.Name)).DriveType -eq 'Fixed' } |
+            Sort-Object Free -Descending | Select-Object -First 1
+    }
+    if ($best) { "$($best.Name):\OpenJarvis" } else { Join-Path $env:LOCALAPPDATA 'OpenJarvis' }
 }
 $srcDir = Join-Path $installRoot 'src'
+
+# Keep caches, uv-managed Python and Ollama models next to the install, and
+# remember the locations for later 'jarvis' / 'ollama' runs (User env vars).
+$persistEnv = [ordered]@{
+    OPENJARVIS_HOME       = $installRoot
+    UV_CACHE_DIR          = (Join-Path $installRoot 'cache\uv')
+    UV_PYTHON_INSTALL_DIR = (Join-Path $installRoot 'python')
+    OLLAMA_MODELS         = (Join-Path $installRoot 'ollama-models')
+}
+foreach ($kv in $persistEnv.GetEnumerator()) {
+    $existing = [System.Environment]::GetEnvironmentVariable($kv.Key, 'User')
+    $value = if ($existing -and $kv.Key -ne 'OPENJARVIS_HOME') { $existing } else { $kv.Value }
+    Set-Item -Path "Env:$($kv.Key)" -Value $value
+    if ($existing -ne $value) {
+        [System.Environment]::SetEnvironmentVariable($kv.Key, $value, 'User')
+    }
+}
+Write-Info "Free space on $($env:SystemDrive): $(Get-FreeGB $env:SystemDrive.TrimEnd(':')) GB"
 
 Write-Info "Install root: $installRoot"
 
@@ -284,8 +317,10 @@ if (-not (Test-Path $installRoot)) {
 $repoUrl = if ($env:OPENJARVIS_REPO_URL) {
     $env:OPENJARVIS_REPO_URL
 } else {
-    'https://github.com/open-jarvis/OpenJarvis.git'
+    'https://github.com/Sofley/openjarvis.git'
 }
+# Branch with the Windows / Russian changes of this fork.
+$repoBranch = if ($env:OPENJARVIS_REPO_BRANCH) { $env:OPENJARVIS_REPO_BRANCH } else { 'claude/jarvis-windows-ru' }
 
 if (Test-Path (Join-Path $srcDir '.git')) {
     if ($Force) {
@@ -302,7 +337,10 @@ if (Test-Path (Join-Path $srcDir '.git')) {
     if ($repoUrl -like 'file://*' -or (Test-Path -LiteralPath $repoUrl -ErrorAction SilentlyContinue)) {
         & $gitExe clone $repoUrl $srcDir
     } else {
-        & $gitExe clone --filter=blob:none $repoUrl $srcDir
+        # Full history (needed for `jarvis --version` and self-update), no old
+        # file contents; this fork's branch when one is configured.
+        $branchArgs = if ($repoBranch) { @('--branch', $repoBranch) } else { @() }
+        & $gitExe clone --filter=blob:none @branchArgs $repoUrl $srcDir
     }
     if ($LASTEXITCODE -ne 0) { Write-Fail "git clone failed" }
     Write-Ok "Cloned to $srcDir"
@@ -346,48 +384,58 @@ function Test-MsvcLinker {
 }
 
 Write-Info "Checking MSVC build tools (needed to compile the native extension)..."
+$usePrebuiltRust = $false
 if (Test-MsvcLinker) {
-    Write-Ok "MSVC build tools present"
+    Write-Ok "MSVC build tools present - the native extension will be compiled locally"
 } else {
-    # Detect and instruct only. Installing the Build Tools is a multi-GB
-    # download behind a UAC prompt, which is not something an installer
-    # should start on the user's behalf without asking.
-    Write-Fail @"
-MSVC build tools not found.
-
-The next step compiles the mandatory openjarvis-rust extension, which
-needs the MSVC linker (link.exe). Without it every cargo build script
-fails with "error: linker ``link.exe`` not found".
-
-Install via winget - expect a multi-GB download and a UAC prompt:
-
-    winget install --id Microsoft.VisualStudio.2022.BuildTools ``
-        --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-
---override is load-bearing: the default Build Tools install ships no
-workload at all, so VCTools has to be requested explicitly.
-
-Alternatively download "Build Tools for Visual Studio" from
-https://visualstudio.microsoft.com/downloads/ and select the
-"Desktop development with C++" workload.
-
-Then re-run this installer.
-"@
+    # No compiler: use the prebuilt openjarvis-rust wheel published by this
+    # fork's "Windows Rust wheel" workflow (release 'rust-wheels-windows').
+    # This avoids installing several GB of Visual Studio Build Tools on C:.
+    Write-Info "MSVC build tools not found - using the prebuilt native extension instead."
+    $usePrebuiltRust = $true
 }
 
-# ---------------------------------------------------------------------------
-# 6. uv sync --extra desktop --group desktop-native
-# ---------------------------------------------------------------------------
-
-Write-Info "Running 'uv sync --extra desktop --group desktop-native' in $srcDir (this can take a few minutes)..."
+Write-Info "Installing Python dependencies in $srcDir (this can take a few minutes)..."
 Push-Location $srcDir
 try {
-    & $uvExe sync --extra desktop --group desktop-native
+    if ($usePrebuiltRust) {
+        & $uvExe sync --extra desktop
+    } else {
+        & $uvExe sync --extra desktop --group desktop-native
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "uv sync failed with exit code $LASTEXITCODE. Check the output above."
     }
 } finally {
     Pop-Location
+}
+
+if ($usePrebuiltRust) {
+    $venvPy = Join-Path $srcDir '.venv\Scripts\python.exe'
+    $pyTag = (& $venvPy -c "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')").Trim()
+    $wheelRepo = if ($env:OPENJARVIS_WHEEL_REPO) { $env:OPENJARVIS_WHEEL_REPO } else { 'Sofley/openjarvis' }
+    Write-Info "Downloading the prebuilt openjarvis-rust for $pyTag from $wheelRepo..."
+    try {
+        $rel = Invoke-RestMethod -UseBasicParsing `
+            -Uri "https://api.github.com/repos/$wheelRepo/releases/tags/rust-wheels-windows"
+    } catch {
+        Write-Fail "Could not read the rust-wheels-windows release of ${wheelRepo}: $($_.Exception.Message)"
+    }
+    $asset = $rel.assets | Where-Object { $_.name -like "*-$pyTag-$pyTag-win_amd64.whl" } | Select-Object -First 1
+    if (-not $asset) {
+        Write-Fail "No prebuilt wheel for $pyTag in $wheelRepo (release rust-wheels-windows). Install Visual Studio Build Tools, or use Python 3.11-3.13, and re-run."
+    }
+    $wheelDir = Join-Path $installRoot 'downloads'
+    if (-not (Test-Path $wheelDir)) { New-Item -ItemType Directory -Path $wheelDir | Out-Null }
+    $wheelPath = Join-Path $wheelDir $asset.name
+    if (-not (Test-Path $wheelPath)) {
+        & curl.exe -L --retry 10 --retry-all-errors -C - -o $wheelPath $asset.browser_download_url
+        if ($LASTEXITCODE -ne 0) { Write-Fail "Download of $($asset.name) failed." }
+    }
+    & $uvExe pip install --python $venvPy $wheelPath
+    if ($LASTEXITCODE -ne 0) { Write-Fail "Installing $($asset.name) failed." }
+    & $venvPy -c "import openjarvis_rust"
+    if ($LASTEXITCODE -ne 0) { Write-Fail "openjarvis_rust does not import after installing the prebuilt wheel." }
 }
 Write-Ok "Dependencies installed"
 
@@ -399,7 +447,9 @@ Write-Info "Checking Ollama..."
 $ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
 if (-not $ollamaExe) {
     Write-Info "  Ollama not on PATH - downloading the official installer (~150 MB)..."
-    $ollamaSetup = Join-Path $env:TEMP 'OllamaSetup.exe'
+    $dlDir = Join-Path $installRoot 'downloads'
+    if (-not (Test-Path $dlDir)) { New-Item -ItemType Directory -Path $dlDir | Out-Null }
+    $ollamaSetup = Join-Path $dlDir 'OllamaSetup.exe'
     # SilentlyContinue is load-bearing in PS 5.1: the default progress
     # bar renderer slows Invoke-WebRequest down 30x on large downloads
     # (a known PS5.1 issue), turning a 30s download into 15+ minutes.
@@ -420,8 +470,14 @@ if (-not $ollamaExe) {
     # OllamaSetup.exe is built with NSIS, whose silent-install flag is
     # /S (uppercase). The Inno-Setup-style /silent would open the GUI
     # and hang `Start-Process -Wait` indefinitely.
-    Write-Info "  Running OllamaSetup.exe /S (this can take a minute)..."
-    Start-Process -FilePath $ollamaSetup -ArgumentList '/S' -Wait
+    $ollamaDir = Join-Path $installRoot 'ollama'
+    Write-Info "  Installing Ollama into $ollamaDir (this can take a minute)..."
+    # Wait for the setup process itself only: Start-Process -Wait would also
+    # wait for 'ollama app.exe', which the installer launches and never exits.
+    $setupProc = Start-Process -FilePath $ollamaSetup -PassThru `
+        -ArgumentList '/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES', "/DIR=`"$ollamaDir`""
+    $setupProc.WaitForExit()
+    if (Test-Path (Join-Path $ollamaDir 'ollama.exe')) { $env:Path = "$ollamaDir;$env:Path" }
     Remove-Item $ollamaSetup -ErrorAction SilentlyContinue
     Update-PathFromRegistry
     $ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
